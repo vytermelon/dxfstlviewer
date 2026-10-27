@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DXF / STL Viewer</title>
+<script src="https://cdn.jsdelivr.net/npm/megajs@1.3.4/dist/main.browser-umd.js"></script>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<style>
+  :root { --bg:#14171c; --panel:#1f242c; --fg:#e6e9ee; --mut:#8a93a1; --acc:#ffb020; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font:14px/1.4 system-ui,-apple-system,Segoe UI,sans-serif; overflow:hidden; }
+  #view { position:absolute; inset:0; }
+  canvas { display:block; touch-action:none; }
+  .box { position:absolute; background:rgba(31,36,44,.92); border:1px solid #333b47;
+    border-radius:8px; padding:10px 12px; }
+  #info { top:10px; left:10px; max-width:320px; }
+  #info h1 { font-size:13px; margin:0 0 4px; word-break:break-all; }
+  #info .m { color:var(--mut); font-size:12px; }
+  #info .sel { margin-top:8px; padding-top:8px; border-top:1px solid #333b47; color:var(--acc); }
+  #coords { bottom:10px; left:10px; font:12px ui-monospace,monospace; color:var(--mut); padding:4px 8px; }
+  #btns { top:10px; right:10px; display:flex; gap:6px; padding:6px; }
+  button { background:#2b323d; color:var(--fg); border:1px solid #3a4351; border-radius:6px;
+    padding:5px 10px; cursor:pointer; font:inherit; }
+  button:hover { background:#374050; }
+  #status { inset:0; margin:auto; width:max-content; height:max-content; max-width:90vw; text-align:center; }
+  #status.err { color:#ff7b7b; }
+  #status form { display:flex; gap:6px; margin-top:8px; }
+  #status input { background:#14171c; color:var(--fg); border:1px solid #3a4351; border-radius:6px;
+    padding:6px 8px; width:340px; max-width:60vw; font:inherit; }
+  .lbl { position:absolute; pointer-events:none; background:var(--acc); color:#000; font:600 12px system-ui;
+    padding:2px 6px; border-radius:4px; transform:translate(-50%,-130%); white-space:nowrap; }
+</style>
+</head>
+<body>
+<div id="view"></div>
+<div id="info" class="box" hidden><h1 id="fname"></h1><div class="m" id="summary"></div><div class="sel" id="sel" hidden></div></div>
+<div id="btns" class="box" hidden><button id="fit">Fit</button><button id="clr">Clear</button></div>
+<div id="coords" class="box" hidden></div>
+<div id="status" class="box">Loading…</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+
+const $ = id => document.getElementById(id);
+const status = $('status'), viewEl = $('view');
+
+/* ---------- URL handling ----------
+   Accepts  ?url=https://mega.nz/file/ID#KEY   (raw, unencoded) or encoded.
+   A raw '#KEY' lands in location.hash, so we stitch it back on. */
+function getMegaUrl() {
+  const q = new URLSearchParams(location.search).get('url');
+  if (!q) return null;
+  let u = q.trim();
+  if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+  if (!u.includes('#') && location.hash.length > 1) u += location.hash;
+  return u;
+}
+
+function fail(msg) {
+  status.hidden = false; status.className = 'box err';
+  status.innerHTML = msg + `<form id="f"><input placeholder="https://mega.nz/file/XXXX#KEY" autofocus><button>Open</button></form>`;
+  $('f').onsubmit = e => { e.preventDefault();
+    const v = e.target.firstChild.value.trim(); if (!v) return;
+    location.href = location.pathname + '?url=' + encodeURIComponent(v); };
+}
+
+/* ---------- Format sniffing ---------- */
+function sniff(buf, name) {
+  const ext = (name.match(/\.(\w+)$/) || [])[1]?.toLowerCase();
+  if (ext === 'dxf' || ext === 'stl') return ext;
+  const head = new TextDecoder().decode(buf.slice(0, 4096));
+  if (/SECTION/.test(head) && /\n\s*2\s*\r?\n\s*(HEADER|ENTITIES|TABLES|BLOCKS|CLASSES)/.test(head)) return 'dxf';
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  if (buf.length > 84 && 84 + dv.getUint32(80, true) * 50 === buf.length) return 'stl';
+  if (/^\s*solid/.test(head) && /facet/.test(head)) return 'stl';
+  return /\n\s*0\s*\r?\n\s*SECTION/.test('\n' + head) ? 'dxf' : 'stl';
+}
+
+/* ---------- Main ---------- */
+const megaUrl = getMegaUrl();
+if (!megaUrl) fail('Add <code>?url=&lt;mega.nz public link&gt;</code> to the address.');
+else load(megaUrl).catch(e => { console.error(e); fail('Failed: ' + (e.message || e)); });
+
+async function load(url) {
+  status.textContent = 'Fetching file info from MEGA…';
+  const file = mega.File.fromURL(url);
+  await file.loadAttributes();
+  const name = file.name || 'file';
+  status.textContent = `Downloading ${name} (${(file.size / 1024).toFixed(0)} KB)…`;
+  const data = new Uint8Array(await file.downloadBuffer());
+  status.hidden = true;
+  $('fname').textContent = name;
+  $('info').hidden = $('btns').hidden = $('coords').hidden = false;
+  const kind = sniff(data, name);
+  kind === 'dxf' ? showDXF(data) : showSTL(data);
+}
+
+/* ---------- Shared renderer ---------- */
+function makeRenderer() {
+  const r = new THREE.WebGLRenderer({ antialias: true });
+  r.setPixelRatio(devicePixelRatio);
+  r.setSize(viewEl.clientWidth, viewEl.clientHeight);
+  r.setClearColor(0x14171c);
+  viewEl.appendChild(r.domElement);
+  return r;
+}
+function onClickNoDrag(el, cb) {
+  let d = null;
+  el.addEventListener('pointerdown', e => d = [e.clientX, e.clientY]);
+  el.addEventListener('pointerup', e => {
+    if (d && Math.hypot(e.clientX - d[0], e.clientY - d[1]) < 4) cb(e);
+    d = null;
+  });
+}
+const fmt = n => (Math.abs(n) >= 1000 ? n.toFixed(1) : n.toFixed(3)).replace(/\.?0+$/, '');
+const rect = e => e.target.getBoundingClientRect();
+
+/* =====================================================
+   DXF
+   ===================================================== */
+const UNITS = { 1:'in', 2:'ft', 4:'mm', 5:'cm', 6:'m' };
+
+function parseDXF(text) {
+  const L = text.split(/\r?\n/);
+  const pairs = [];
+  for (let i = 0; i + 1 < L.length; i += 2) pairs.push([parseInt(L[i], 10), L[i + 1].trim()]);
+  const out = { units: '', entities: [], blocks: {} };
+  let i = 0, section = '', block = null, cur = null, lastPoly = null;
+  for (; i < pairs.length; i++) {
+    const [c, v] = pairs[i];
+    if (section === 'HEADER' && c === 9 && v === '$INSUNITS') out.units = UNITS[+pairs[i + 1][1]] || '';
+    if (c === 0 && v === 'SECTION') { section = pairs[i + 1][1]; i++; continue; }
+    if (c === 0 && v === 'ENDSEC') { section = ''; cur = null; continue; }
+    if (section === 'BLOCKS' && c === 0 && v === 'BLOCK') {
+      block = { base: [0, 0], ents: [] }; cur = null;
+      for (let j = i + 1; j < pairs.length && pairs[j][0] !== 0; j++) {
+        if (pairs[j][0] === 2) out.blocks[pairs[j][1]] = block;
+        if (pairs[j][0] === 10) block.base[0] = +pairs[j][1];
+        if (pairs[j][0] === 20) block.base[1] = +pairs[j][1];
+      }
+      continue;
+    }
+    if (section === 'BLOCKS' && c === 0 && v === 'ENDBLK') { block = null; cur = null; continue; }
+    if (section !== 'ENTITIES' && !(section === 'BLOCKS' && block)) continue;
+    if (c === 0) {
+      if (v === 'VERTEX' && lastPoly) { cur = { type: 'VERTEX', p: [] }; lastPoly.verts.push(cur); continue; }
+      if (v === 'SEQEND') { lastPoly = null; cur = null; continue; }
+      cur = { type: v, p: [], verts: [] };
+      (block ? block.ents : out.entities).push(cur);
+      if (v === 'POLYLINE') lastPoly = cur;
+    } else if (cur) cur.p.push([c, v]);
+  }
+  return out;
+}
+
+const g = (e, c, d = 0) => { const f = e.p.find(p => p[0] === c); return f ? +f[1] : d; };
+const gs = (e, c) => e.p.filter(p => p[0] === c).map(p => +p[1]);
+
+function polyVerts(e) {
+  if (e.type === 'LWPOLYLINE') {
+    const vs = [];
+    for (const [c, v] of e.p) {
+      if (c === 10) vs.push({ x: +v, y: 0, b: 0 });
+      else if (c === 20 && vs.length) vs[vs.length - 1].y = +v;
+      else if (c === 42 && vs.length) vs[vs.length - 1].b = +v;
+    }
+    return vs;
+  }
+  return e.verts.filter(v => v.type === 'VERTEX').map(v => ({ x: g(v, 10), y: g(v, 20), b: g(v, 42) }));
+}
+
+const TAU = Math.PI * 2;
+const mod = a => ((a % TAU) + TAU) % TAU;
+
+function bulgeToArc(p1, p2, b) {
+  const dx = p2.x - p1.x, dy = p2.y - p1.y, d = Math.hypot(dx, dy);
+  const a = (d / 2) * (1 - b * b) / (2 * b);
+  const cx = (p1.x + p2.x) / 2 - dy / d * a, cy = (p1.y + p2.y) / 2 + dx / d * a;
+  const r = d * (1 + b * b) / (4 * Math.abs(b));
+  let a0 = Math.atan2(p1.y - cy, p1.x - cx), a1 = Math.atan2(p2.y - cy, p2.x - cx);
+  if (b < 0) [a0, a1] = [a1, a0];
+  return { t: 'arc', cx, cy, r, a0, a1 };
+}
+
+function buildPrims(parsed) {
+  const prims = [];
+  const seg = (x1, y1, x2, y2) => { if (x1 !== x2 || y1 !== y2) prims.push({ t: 'line', x1, y1, x2, y2 }); };
+  function emit(ents, xf, depth) {
+    const T = (x, y) => {
+      x *= xf.s; y *= xf.s;
+      const c = Math.cos(xf.r), s = Math.sin(xf.r);
+      return { x: x * c - y * s + xf.x, y: x * s + y * c + xf.y };
+    };
+    for (const e of ents) {
+      switch (e.type) {
+        case 'LINE': { const a = T(g(e, 10), g(e, 20)), b = T(g(e, 11), g(e, 21)); seg(a.x, a.y, b.x, b.y); break; }
+        case 'CIRCLE': { const c = T(g(e, 10), g(e, 20)); prims.push({ t: 'circle', cx: c.x, cy: c.y, r: g(e, 40) * xf.s }); break; }
+        case 'ARC': { const c = T(g(e, 10), g(e, 20));
+          prims.push({ t: 'arc', cx: c.x, cy: c.y, r: g(e, 40) * xf.s,
+            a0: g(e, 50) * Math.PI / 180 + xf.r, a1: g(e, 51) * Math.PI / 180 + xf.r }); break; }
+        case 'LWPOLYLINE': case 'POLYLINE': {
+          const vs = polyVerts(e), closed = (g(e, 70) & 1) === 1, n = vs.length;
+          for (let k = 0; k < (closed ? n : n - 1); k++) {
+            const p1 = vs[k], p2 = vs[(k + 1) % n];
+            const a = T(p1.x, p1.y), b = T(p2.x, p2.y);
+            if (p1.b) { const arc = bulgeToArc(a, b, p1.b * (xf.s < 0 ? -1 : 1)); prims.push(arc); }
+            else seg(a.x, a.y, b.x, b.y);
+          }
+          break; }
+        case 'ELLIPSE': {
+          const c = [g(e, 10), g(e, 20)], mx = g(e, 11), my = g(e, 21), ratio = g(e, 40, 1);
+          let t0 = g(e, 41, 0), t1 = g(e, 42, TAU); if (t1 <= t0) t1 += TAU;
+          const N = 64; let prev = null;
+          for (let k = 0; k <= N; k++) {
+            const t = t0 + (t1 - t0) * k / N;
+            const px = c[0] + mx * Math.cos(t) - my * ratio * Math.sin(t);
+            const py = c[1] + my * Math.cos(t) + mx * ratio * Math.sin(t);
+            const q = T(px, py); if (prev) seg(prev.x, prev.y, q.x, q.y); prev = q;
+          } break; }
+        case 'SPLINE': {
+          const xs = gs(e, 11).length ? gs(e, 11) : gs(e, 10), ys = gs(e, 21).length ? gs(e, 21) : gs(e, 20);
+          let prev = null;
+          xs.forEach((x, k) => { const q = T(x, ys[k]); if (prev) seg(prev.x, prev.y, q.x, q.y); prev = q; });
+          break; }
+        case 'INSERT': {
+          const blk = parsed.blocks[e.p.find(p => p[0] === 2)?.[1]];
+          if (!blk || depth > 5) break;
+          const o = T(g(e, 10), g(e, 20));
+          const sc = g(e, 41, 1);
+          emit(blk.ents, { x: o.x - 0, y: o.y - 0, s: xf.s * sc, r: xf.r + g(e, 50) * Math.PI / 180 }, depth + 1);
+          break; }
+      }
+    }
+  }
+  emit(parsed.entities, { x: 0, y: 0, s: 1, r: 0 }, 0);
+  return prims;
+}
+
+const sweepOf = p => { const s = mod(p.a1 - p.a0); return s === 0 ? TAU : s; };
+function primPoints(p) {
+  if (p.t === 'line') return [[p.x1, p.y1], [p.x2, p.y2]];
+  const sw = p.t === 'circle' ? TAU : sweepOf(p), a0 = p.t === 'circle' ? 0 : p.a0;
+  const n = Math.max(12, Math.ceil(sw / (Math.PI / 90))), pts = [];
+  for (let k = 0; k <= n; k++) { const a = a0 + sw * k / n; pts.push([p.cx + p.r * Math.cos(a), p.cy + p.r * Math.sin(a)]); }
+  return pts;
+}
+function distToPrim(p, x, y) {
+  if (p.t === 'line') {
+    const dx = p.x2 - p.x1, dy = p.y2 - p.y1, l2 = dx * dx + dy * dy;
+    const t = Math.max(0, Math.min(1, ((x - p.x1) * dx + (y - p.y1) * dy) / l2));
+    return Math.hypot(x - (p.x1 + t * dx), y - (p.y1 + t * dy));
+  }
+  const d = Math.hypot(x - p.cx, y - p.cy);
+  if (p.t === 'circle') return Math.abs(d - p.r);
+  const a = mod(Math.atan2(y - p.cy, x - p.cx) - p.a0);
+  if (a <= sweepOf(p)) return Math.abs(d - p.r);
+  const e = [p.a0, p.a0 + sweepOf(p)].map(t => Math.hypot(x - (p.cx + p.r * Math.cos(t)), y - (p.cy + p.r * Math.sin(t))));
+  return Math.min(...e);
+}
+function describe(p, u) {
+  u = u ? ' ' + u : '';
+  if (p.t === 'line') {
+    const dx = p.x2 - p.x1, dy = p.y2 - p.y1;
+    return `<b>Line</b><br>Length: ${fmt(Math.hypot(dx, dy))}${u}<br>ΔX ${fmt(Math.abs(dx))} · ΔY ${fmt(Math.abs(dy))}<br>Angle: ${fmt(mod(Math.atan2(dy, dx)) * 180 / Math.PI)}°`;
+  }
+  if (p.t === 'circle')
+    return `<b>Circle</b><br>Ø ${fmt(p.r * 2)}${u} · R ${fmt(p.r)}${u}<br>Circumference: ${fmt(TAU * p.r)}${u}<br>Center: ${fmt(p.cx)}, ${fmt(p.cy)}`;
+  const sw = sweepOf(p);
+  return `<b>Arc</b><br>R ${fmt(p.r)}${u} · Ø ${fmt(p.r * 2)}${u}<br>Sweep: ${fmt(sw * 180 / Math.PI)}°<br>Arc length: ${fmt(sw * p.r)}${u}<br>Center: ${fmt(p.cx)}, ${fmt(p.cy)}`;
+}
+function shortLabel(p) {
+  if (p.t === 'line') return fmt(Math.hypot(p.x2 - p.x1, p.y2 - p.y1));
+  return (p.t === 'circle' ? 'Ø ' : 'R ') + fmt(p.t === 'circle' ? p.r * 2 : p.r);
+}
+
+function showDXF(data) {
+  const parsed = parseDXF(new TextDecoder().decode(data));
+  const prims = buildPrims(parsed);
+  if (!prims.length) return fail('No supported geometry found in DXF.');
+  const u = parsed.units;
+
+  const renderer = makeRenderer(), scene = new THREE.Scene();
+  const positions = [];
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of prims) {
+    const pts = primPoints(p);
+    pts.forEach(([x, y], k) => {
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+      if (k) positions.push(pts[k - 1][0], pts[k - 1][1], 0, x, y, 0);
+    });
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  scene.add(new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: 0x6fd3ff })));
+
+  const hiGeo = new THREE.BufferGeometry();
+  const hi = new THREE.Line(hiGeo, new THREE.LineBasicMaterial({ color: 0xffb020, depthTest: false }));
+  hi.visible = false; hi.renderOrder = 5; scene.add(hi);
+
+  const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, -1e6, 1e6);
+  cam.position.z = 10;
+  const ctl = new OrbitControls(cam, renderer.domElement);
+  ctl.enableRotate = false; ctl.screenSpacePanning = true;
+  ctl.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.PAN };
+  ctl.touches = { ONE: THREE.TOUCH.PAN, TWO: THREE.TOUCH.DOLLY_PAN };
+  ctl.zoomSpeed = 1.4;
+
+  const w = maxX - minX, h = maxY - minY;
+  $('summary').innerHTML = `DXF · ${prims.length} segments<br>Overall: ${fmt(w)} × ${fmt(h)}${u ? ' ' + u : ''}<br>Click a line, arc or circle for its dimensions.`;
+
+  function fit() {
+    const W = viewEl.clientWidth, H = viewEl.clientHeight, asp = W / H;
+    const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+    let hh = Math.max(h, w / asp, 1e-6) * 0.55;
+    cam.left = -hh * asp; cam.right = hh * asp; cam.top = hh; cam.bottom = -hh;
+    cam.zoom = 1; cam.position.set(cx, cy, 10); ctl.target.set(cx, cy, 0);
+    cam.updateProjectionMatrix(); ctl.update();
+  }
+  function resize() {
+    const W = viewEl.clientWidth, H = viewEl.clientHeight;
+    renderer.setSize(W, H);
+    const hh = cam.top, asp = W / H;
+    cam.left = -hh * asp; cam.right = hh * asp; cam.updateProjectionMatrix();
+  }
+  addEventListener('resize', resize);
+  fit(); $('fit').onclick = fit;
+
+  const el = document.createElement('div'); el.className = 'lbl'; el.hidden = true; document.body.appendChild(el);
+  let selected = null;
+  const clear = () => { selected = null; hi.visible = false; el.hidden = true; $('sel').hidden = true; };
+  $('clr').onclick = clear;
+
+  const toWorld = e => {
+    const r = rect(e), v = new THREE.Vector3(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1, 0);
+    return v.unproject(cam);
+  };
+  const pxToWorld = () => (cam.top - cam.bottom) / cam.zoom / viewEl.clientHeight;
+
+  renderer.domElement.addEventListener('pointermove', e => {
+    const p = toWorld(e); $('coords').textContent = `X ${fmt(p.x)}   Y ${fmt(p.y)}${u ? '  (' + u + ')' : ''}`;
+  });
+  onClickNoDrag(renderer.domElement, e => {
+    const p = toWorld(e), tol = pxToWorld() * 8;
+    let best = null, bd = tol;
+    for (const pr of prims) { const d = distToPrim(pr, p.x, p.y); if (d < bd) { bd = d; best = pr; } }
+    if (!best) return clear();
+    selected = best;
+    const pts = primPoints(best);
+    hiGeo.setAttribute('position', new THREE.Float32BufferAttribute(pts.flatMap(([x, y]) => [x, y, 0.1]), 3));
+    hi.visible = true;
+    $('sel').hidden = false; $('sel').innerHTML = describe(best, u);
+    el.textContent = shortLabel(best) + (u ? ' ' + u : ''); el.hidden = false;
+  });
+
+  function labelPos() {
+    if (!selected) return;
+    const pts = primPoints(selected), m = pts[Math.floor(pts.length / 2)];
+    const v = new THREE.Vector3(m[0], m[1], 0).project(cam), r = viewEl.getBoundingClientRect();
+    el.style.left = (v.x * 0.5 + 0.5) * r.width + r.left + 'px';
+    el.style.top = (-v.y * 0.5 + 0.5) * r.height + r.top + 'px';
+  }
+  (function loop() { requestAnimationFrame(loop); ctl.update(); labelPos(); renderer.render(scene, cam); })();
+}
+
+/* =====================================================
+   STL
+   ===================================================== */
+function showSTL(data) {
+  const geo = new STLLoader().parse(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+  geo.computeVertexNormals(); geo.computeBoundingBox();
+  const bb = geo.boundingBox, size = bb.getSize(new THREE.Vector3()), ctr = bb.getCenter(new THREE.Vector3());
+  const tris = (geo.index ? geo.index.count : geo.attributes.position.count) / 3;
+
+  const renderer = makeRenderer(), scene = new THREE.Scene();
+  const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0x9fb4c8, metalness: 0.2, roughness: 0.6, side: THREE.DoubleSide }));
+  scene.add(mesh);
+  scene.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo, 30), new THREE.LineBasicMaterial({ color: 0x1b2430 })));
+  scene.add(new THREE.Box3Helper(bb, 0x556070));
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.1));
+  const dl = new THREE.DirectionalLight(0xffffff, 1.6); scene.add(dl);
+
+  const radius = size.length() / 2 || 1;
+  const cam = new THREE.PerspectiveCamera(45, 1, radius / 1000, radius * 100);
+  const ctl = new OrbitControls(cam, renderer.domElement);
+  ctl.enableDamping = true;
+  function fit() {
+    cam.position.copy(ctr).add(new THREE.Vector3(1, -1.4, 1).normalize().multiplyScalar(radius * 2.6));
+    cam.up.set(0, 0, 1); ctl.target.copy(ctr); ctl.update();
+  }
+  function resize() {
+    const W = viewEl.clientWidth, H = viewEl.clientHeight;
+    renderer.setSize(W, H); cam.aspect = W / H; cam.updateProjectionMatrix();
+  }
+  addEventListener('resize', resize); resize(); fit(); $('fit').onclick = fit;
+
+  $('summary').innerHTML = `STL · ${tris.toLocaleString()} triangles<br>Bounding box: ${fmt(size.x)} × ${fmt(size.y)} × ${fmt(size.z)}<br>Click two points on the model to measure the distance.`;
+
+  const raycaster = new THREE.Raycaster(), pts = [], marks = [];
+  const mr = radius * 0.015;
+  const lineGeo = new THREE.BufferGeometry();
+  const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0xffb020, depthTest: false }));
+  line.renderOrder = 5; line.visible = false; scene.add(line);
+  const el = document.createElement('div'); el.className = 'lbl'; el.hidden = true; document.body.appendChild(el);
+  const clear = () => { pts.length = 0; marks.splice(0).forEach(m => scene.remove(m)); line.visible = false; el.hidden = true; $('sel').hidden = true; };
+  $('clr').onclick = clear;
+
+  const ndc = e => { const r = rect(e); return new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1); };
+  const hit = e => { raycaster.setFromCamera(ndc(e), cam); return raycaster.intersectObject(mesh)[0]; };
+
+  renderer.domElement.addEventListener('pointermove', e => {
+    const h = hit(e); $('coords').textContent = h ? `X ${fmt(h.point.x)}   Y ${fmt(h.point.y)}   Z ${fmt(h.point.z)}` : '';
+  });
+  onClickNoDrag(renderer.domElement, e => {
+    const h = hit(e); if (!h) return clear();
+    if (pts.length >= 2) clear();
+    pts.push(h.point.clone());
+    const m = new THREE.Mesh(new THREE.SphereGeometry(mr, 12, 12), new THREE.MeshBasicMaterial({ color: 0xffb020, depthTest: false }));
+    m.position.copy(h.point); m.renderOrder = 6; scene.add(m); marks.push(m);
+    $('sel').hidden = false;
+    if (pts.length === 1) {
+      $('sel').innerHTML = `<b>Point A</b><br>${fmt(pts[0].x)}, ${fmt(pts[0].y)}, ${fmt(pts[0].z)}<br>Click a second point.`;
+    } else {
+      const d = pts[1].clone().sub(pts[0]);
+      lineGeo.setFromPoints(pts); line.visible = true;
+      $('sel').innerHTML = `<b>Distance</b>: ${fmt(d.length())}<br>ΔX ${fmt(Math.abs(d.x))} · ΔY ${fmt(Math.abs(d.y))} · ΔZ ${fmt(Math.abs(d.z))}`;
+      el.textContent = fmt(d.length()); el.hidden = false;
+    }
+  });
+
+  (function loop() {
+    requestAnimationFrame(loop); ctl.update();
+    dl.position.copy(cam.position);
+    if (!el.hidden && pts.length === 2) {
+      const mid = pts[0].clone().add(pts[1]).multiplyScalar(0.5).project(cam), r = viewEl.getBoundingClientRect();
+      el.style.left = (mid.x * 0.5 + 0.5) * r.width + r.left + 'px';
+      el.style.top = (-mid.y * 0.5 + 0.5) * r.height + r.top + 'px';
+    }
+    renderer.render(scene, cam);
+  })();
+}
+</script>
+</body>
+</html>
