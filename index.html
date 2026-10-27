@@ -137,7 +137,7 @@ function parseDXF(text) {
   let i = 0, section = '', block = null, cur = null, lastPoly = null;
   for (; i < pairs.length; i++) {
     const [c, v] = pairs[i];
-    if (section === 'HEADER' && c === 9 && v === '$INSUNITS') out.units = UNITS[+pairs[i + 1][1]] || '';
+    if (section === 'HEADER' && c === 9 && v === '$INSUNITS') out.units = UNITS[+pairs[i + 1][1]] || 'mm';
     if (c === 0 && v === 'SECTION') { section = pairs[i + 1][1]; i++; continue; }
     if (c === 0 && v === 'ENDSEC') { section = ''; cur = null; continue; }
     if (section === 'BLOCKS' && c === 0 && v === 'BLOCK') {
